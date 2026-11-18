@@ -1,0 +1,26 @@
+# Copy to .github/workflows/script-drift-watch.yml in the repository that
+# holds your sites.yml. Replace OWNER with the GitHub user/org hosting the action.
+name: Script Drift Watch
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly, at minute 17
+  workflow_dispatch:       # "Run workflow" button for manual runs
+
+permissions:
+  contents: write          # commit the updated baseline.json
+  issues: write            # open an issue on high-severity findings
+
+concurrency:
+  group: script-drift-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: OWNER/script-drift-watch@v1
+        with:
+          config: sites.yml
+          baseline: baseline.json

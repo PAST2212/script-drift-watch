@@ -1,0 +1,139 @@
+name: Script Drift Watch
+description: Alerts you when trusted third-party scripts on your website change and start skimming, clipping or loading code.
+author: script-drift-watch contributors
+branding:
+  icon: eye
+  color: red
+
+inputs:
+  config:
+    description: Path to the sites file in your repository.
+    default: sites.yml
+  baseline:
+    description: Path to the baseline file (created on the first run, committed back to the repo).
+    default: baseline.json
+  commit-baseline:
+    description: Commit and push the updated baseline so the same change is not reported twice.
+    default: "true"
+  open-issue:
+    description: Open a GitHub issue when a high-severity finding is detected.
+    default: "true"
+  fail-on-high:
+    description: Fail the job when a high-severity finding is detected.
+    default: "true"
+  args:
+    description: Extra command-line arguments for script-drift-watch (e.g. "--settle-ms 5000").
+    default: ""
+  node-version:
+    description: Node.js version used to run the scanner.
+    default: "24"
+  token:
+    description: Token used to open issues.
+    default: ${{ github.token }}
+
+outputs:
+  exit-code:
+    description: "0 = no high-severity findings, 2 = high-severity finding, 1 = error"
+    value: ${{ steps.scan.outputs.exit-code }}
+  report:
+    description: Path to the Markdown report.
+    value: ${{ steps.scan.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install scanner and Chromium
+      id: install
+      shell: bash
+      run: |
+        cd "$GITHUB_ACTION_PATH"
+        # npm ci: exactly the versions and integrity hashes in package-lock.json, no lifecycle scripts.
+        npm ci --omit=dev --ignore-scripts --no-audit --no-fund --loglevel=error
+        # Only the real Chromium (new headless) is used, so skip the headless-shell download.
+        # No browser cache on purpose: Playwright advises against it (restoring takes about as long
+        # as downloading, and the Linux system dependencies cannot be cached).
+        npx playwright install --with-deps --no-shell chromium
+
+    - name: Scan sites
+      id: scan
+      shell: bash
+      env:
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_ARGS: ${{ inputs.args }}
+        INPUT_COMMIT: ${{ inputs.commit-baseline }}
+      run: |
+        report="$RUNNER_TEMP/script-drift-watch-report.md"
+        had_baseline=false
+        if [ -f "$INPUT_BASELINE" ]; then had_baseline=true; fi
+        # The report contains attacker-controlled script excerpts: stop the runner
+        # from interpreting workflow commands (::error:: etc.) while it is printed.
+        stop_token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+        echo "::stop-commands::$stop_token"
+        set +e
+        # INPUT_ARGS is intentionally unquoted so it splits into separate arguments.
+        node "$GITHUB_ACTION_PATH/bin/script-drift-watch.js" \
+          --config "$INPUT_CONFIG" --baseline "$INPUT_BASELINE" --report "$report" \
+          --update-baseline $INPUT_ARGS
+        code=$?
+        set -e
+        echo "::$stop_token::"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+        if [ "$had_baseline" = false ] && [ "$INPUT_COMMIT" != "true" ]; then
+          echo "::warning::No baseline existed and commit-baseline is false, so the new baseline is lost after this job and monitoring never starts. Commit an initial $INPUT_BASELINE (e.g. created with the CLI) or set commit-baseline: true."
+        fi
+        if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
+          echo "::error::script-drift-watch failed with exit code $code"
+          exit "$code"
+        fi
+
+    - name: Open issue
+      id: issue
+      if: ${{ !cancelled() && steps.scan.outputs.exit-code == '2' && inputs.open-issue == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        REPORT: ${{ steps.scan.outputs.report }}
+      run: |
+        body="$RUNNER_TEMP/script-drift-watch-issue.md"
+        # GitHub issue bodies are limited to 65536 characters.
+        head -c 60000 "$REPORT" > "$body"
+        gh issue create \
+          --title "Script Drift Watch: suspicious third-party script change ($(date -u +%Y-%m-%d))" \
+          --body-file "$body"
+
+    - name: Commit baseline
+      id: commit
+      if: ${{ !cancelled() && steps.scan.outcome == 'success' && inputs.commit-baseline == 'true' }}
+      shell: bash
+      env:
+        INPUT_BASELINE: ${{ inputs.baseline }}
+      run: |
+        if [ ! -f "$INPUT_BASELINE" ]; then echo "No baseline written."; exit 0; fi
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add -- "$INPUT_BASELINE"
+        if git diff --cached --quiet; then
+          echo "Baseline unchanged."
+        else
+          git commit -q -m "chore: update script-drift-watch baseline"
+          if ! git push -q; then
+            echo "::error::Could not push the updated baseline (protected branch or concurrent push?). The same change will be reported again on the next run."
+            exit 1
+          fi
+        fi
+
+    - name: Fail on high-severity finding
+      id: fail
+      if: ${{ !cancelled() && steps.scan.outputs.exit-code == '2' && inputs.fail-on-high == 'true' }}
+      shell: bash
+      run: |
+        echo "::error::High-severity change in a third-party script detected. See the job summary or the opened issue."
+        exit 1

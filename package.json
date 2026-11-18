@@ -1,0 +1,36 @@
+{
+  "name": "script-drift-watch",
+  "version": "0.1.0",
+  "description": "Detects when trusted third-party scripts on your website change and start doing suspicious things (clipboard hijacking, card skimming, obfuscated loaders).",
+  "type": "module",
+  "bin": {
+    "script-drift-watch": "bin/script-drift-watch.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "action.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "security",
+    "supply-chain",
+    "magecart",
+    "skimming",
+    "javascript",
+    "github-action",
+    "csp"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "1.63.0",
+    "yaml": "2.9.0"
+  }
+}

@@ -1,0 +1,8 @@
+# Pages to watch. Pick the pages where third-party scripts matter most:
+# home page, login, checkout, crypto/payment pages.
+sites:
+  - url: https://www.example.com/
+  - url: https://shop.example.com/checkout
+    ios: true                      # also load the page as an iPhone
+    ignore:                        # substrings of script URLs to skip
+      - "googletagmanager.com/gtm.js"
