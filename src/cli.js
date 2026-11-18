@@ -2,10 +2,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import YAML, { LineCounter } from "yaml";
 import { scanScript } from "./rules.js";
-import { scriptKey, scriptHost, diffSite, sameScriptContent } from "./diff.js";
+import { scriptKey, scriptHost, diffSite, sameScriptContent, ignoredBy } from "./diff.js";
 import { buildReport, buildErrorReport } from "./report.js";
 import { collectScripts, launchBrowser, IPHONE_UA } from "./collect.js";
-import { assessScriptLoads, parseOriginPolicy } from "./loads.js";
+import { assessScriptLoads, parseOriginPolicy, unmatchedPolicies } from "./loads.js";
 
 const USAGE = `Usage: script-drift-watch [options]
 
@@ -111,6 +111,13 @@ export function parseSites(text) {
     const site = { url: String(entry.url), ignore: Array.isArray(ignore) ? ignore.map(String) : [], ios: entry.ios === true };
     if (Object.hasOwn(entry, "allowed-script-origins")) {
       site.allowedScriptOrigins = parseOriginPolicy(entry["allowed-script-origins"], at, problems);
+      // Ignore patterns also skip loads on the loader end, so such a policy could never apply.
+      for (const key of Object.keys(site.allowedScriptOrigins)) {
+        const pattern = ignoredBy(key, site.ignore);
+        if (pattern) {
+          problems.push(`${at}: allowed-script-origins entry ${key} is also matched by ignore pattern "${pattern}", so the policy could never apply; remove one of them`);
+        }
+      }
     }
     return site;
   });
@@ -211,7 +218,7 @@ async function readBaseline(path) {
 function inspectScripts(collected, ambiguousUrls, ignore, oldEntry) {
   const grouped = new Map();
   for (const s of collected) {
-    if (ignore.some(pattern => s.url.includes(pattern))) continue;
+    if (ignoredBy(s.url, ignore)) continue;
     const key = scriptKey(s.url, s.hash);
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push(s);
@@ -265,7 +272,8 @@ async function scanTarget(browser, target, oldEntry, opts) {
     return {
       site, firstRun, diff, findings: fresh, known, warnings, entry,
       loadFindings: graph.findings, unattributed: graph.unattributed,
-      ambiguousUrls: ambiguousUrls.filter(child => !ignore.some(pattern => child.includes(pattern))),
+      unmatchedPolicies: unmatchedPolicies(allowedScriptOrigins, loads),
+      ambiguousUrls: ambiguousUrls.filter((child) => !ignoredBy(child, ignore)),
     };
   } catch (e) {
     return { site, firstRun: false, error: e.message.split("\n")[0], diff: { added: [], changed: [], removed: [] }, findings: {}, entry: null };

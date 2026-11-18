@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import { main, parseSites } from "../src/cli.js";
-import { assessScriptLoads } from "../src/loads.js";
+import { assessScriptLoads, unmatchedPolicies } from "../src/loads.js";
 
 const policyKey = "allowed-script-origins";
 const loader = "https://vendor.example/tag.js";
@@ -40,6 +40,39 @@ test("invalid or ambiguous script origin policies report the site and bad value"
   ]) {
     assert.throws(() => parseSites(config(policy)), e => e.message.includes("sites[0]") && e.message.includes(bad));
   }
+});
+
+// ---- Review findings ----
+test("a policy for a loader that the same site ignores is rejected, naming both", () => {
+  const text = YAML.stringify({ sites: [{ url: "https://shop.example/", ignore: ["vendor.example/tag.js"], [policyKey]: { [loader]: [] } }] });
+  assert.throws(() => parseSites(text), e => e.message.includes(loader) && e.message.includes("vendor.example/tag.js"));
+});
+
+test("policy entries whose loader matched no script request on the page are listed", () => {
+  const moved = "https://vendor.example/v2/tag.js";
+  const loads = [{ parentUrl: null, url: moved + "?cb=1" }, { parentUrl: moved, url: "https://assets.example/a.js" }];
+  assert.deepEqual(unmatchedPolicies({ [loader]: [], [moved]: ["https://assets.example"] }, loads), [loader]);
+  assert.deepEqual(unmatchedPolicies(undefined, loads), []);
+});
+
+test("a blob: loader keeps one identity when its content changes between scans", () => {
+  const child = "https://partner.example/x.js";
+  const scan = (blob, previous) => assessScriptLoads({
+    loads: [{ parentUrl: "blob:https://shop.example/" + blob, url: child }],
+    bodies: new Map([["blob:https://shop.example/" + blob, { hash: blob.repeat(16) }]]), previous,
+  });
+  const first = scan("aaaa", {});
+  const second = scan("bbbb", first.origins);
+  assert.deepEqual(second.findings, []);
+  assert.deepEqual(Object.keys(second.origins), Object.keys(first.origins));
+});
+
+test("evidence and finding order use code-unit order, independent of the machine's locale", () => {
+  const upper = "https://assets.example/B.js";
+  const lower = "https://assets.example/a.js";
+  const loads = [{ parentUrl: loader, url: lower }, { parentUrl: loader, url: upper }];
+  const result = assessScriptLoads({ loads, bodies: new Map(), policy: { [loader]: [] } });
+  assert.equal(result.findings[0].child, upper);
 });
 
 test("an explicitly forbidden request by a redirected loader alarms even with a 404, and stays visible until permitted", async t => {

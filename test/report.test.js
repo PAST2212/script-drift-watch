@@ -44,6 +44,15 @@ test("a content finding on an ambiguous URL explains why its loader cannot be na
   assert.match(result.markdown, /Multiple response bodies/);
 });
 
+test("a policy that matched no script is named as not applying, without changing the exit code", () => {
+  const r = buildReport([{ site: "https://shop.example", firstRun: false, diff: noDiff, findings: {},
+    unmatchedPolicies: ["https://cdn.vendor.example/js/123/tag.js"] }]);
+  assert.equal(r.exitCode, 0);
+  assert.match(r.markdown, /allowed-script-origins/);
+  assert.match(r.markdown, /`https:\/\/cdn\.vendor\.example\/js\/123\/tag\.js`/);
+  assert.match(r.markdown, /matched no script/);
+});
+
 test("first run says the baseline was created and never alarms", () => {
   const r = buildReport([
     { site: "https://shop.example", firstRun: true, diff: { ...noDiff, added: [SCRIPT] }, findings: {} },

@@ -2,7 +2,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { collectScripts, launchBrowser, IPHONE_UA } from "../src/collect.js";
+import { collectScripts, launchBrowser, IPHONE_UA, drainPending, observeInitiators } from "../src/collect.js";
 
 let server, base, browser;
 const seen = { ua: [], probe: [], chUa: [], brands: [], touch: [] };
@@ -23,11 +23,26 @@ const pages = {
     +'&touch='+navigator.maxTouchPoints;document.head.appendChild(s);</script>`,
 };
 
+// Review finding: loaders that inject their child from eval'd, Function-built or string-timer code
+// (the innermost stack frame then has no script URL), including a fake sourceURL label.
+const inject = (child) => `var s=document.createElement('script');s.src='${child}';document.head.appendChild(s);`;
+const evalLoaders = {
+  "/eval-loader.js": `eval(${JSON.stringify(inject("/eval-child.js"))});`,
+  "/function-loader.js": `new Function(${JSON.stringify(inject("/function-child.js"))})();`,
+  "/string-timer-loader.js": `setTimeout(${JSON.stringify(inject("/string-timer-child.js"))}, 10);`,
+  "/labeled-eval-loader.js": `eval(${JSON.stringify(inject("/labeled-eval-child.js") + "\n//# sourceURL=innocent.js")});`,
+};
+for (const path of Object.keys(evalLoaders)) pages[path.replace(".js", ".html")] = `<script src="${path}"></script>`;
+
 before(async () => {
   server = http.createServer((req, res) => {
     const u = new URL(req.url, "http://x");
     seen.ua.push(req.headers["user-agent"]);
     seen.chUa.push(req.headers["sec-ch-ua"]);
+    if (evalLoaders[u.pathname]) {
+      res.writeHead(200, { "content-type": "text/javascript" });
+      return res.end(evalLoaders[u.pathname]);
+    }
     if (u.pathname === "/probe.js") {
       seen.brands.push(u.searchParams.get("brands"));
       seen.touch.push(u.searchParams.get("touch"));
@@ -97,6 +112,38 @@ after(async () => {
 });
 
 const opts = { timeoutMs: 2000, settleMs: 100 };
+
+// Review finding (verified with probes/probe-debugger-pause.mjs: 1 of 25 navigations paused on
+// `debugger;` despite deactivated breakpoints, and the scan timed out). Any pause must be resumed.
+test("a debugger pause is resumed at once, so `debugger;` cannot hang the scan", async () => {
+  const sent = [];
+  const handlers = {};
+  const session = { on: (event, fn) => { handlers[event] = fn; }, send: async (method) => { sent.push(method); } };
+  await observeInitiators(session, () => {});
+  sent.length = 0;
+  handlers["Debugger.paused"]?.({ reason: "other" });
+  assert.deepEqual(sent, ["Debugger.resume"]);
+});
+
+// Review finding: a response that arrives while earlier body reads are awaited must not be dropped.
+test("waiting for script bodies also awaits reads queued while waiting", async () => {
+  const pending = [];
+  let lateRead = false;
+  pending.push(new Promise((resolve) => setTimeout(() => {
+    pending.push(new Promise((done) => setTimeout(() => { lateRead = true; done(); }, 20)));
+    resolve();
+  }, 10)));
+  await drainPending(pending);
+  assert.equal(lateRead, true);
+});
+
+test("a child injected from eval'd, Function-built or string-timer code is attributed to the script that ran it", async () => {
+  for (const loader of Object.keys(evalLoaders)) {
+    const { loads } = await collectScripts(browser, base + loader.replace(".js", ".html"), { ...opts, settleMs: 300 });
+    const child = base + loader.replace("-loader.js", "-child.js");
+    assert.deepEqual(loads.filter((l) => l.url === child).map((l) => l.parentUrl), [base + loader], loader);
+  }
+});
 
 test("collecting initiator stacks never pauses the page on a debugger statement", async () => {
   const { loads } = await collectScripts(browser, `${base}/debug.html`, opts);
