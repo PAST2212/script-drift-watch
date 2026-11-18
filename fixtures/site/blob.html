@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<head>
+  <title>Blob loader</title>
+  <script>
+    // A runtime-generated script, as some loaders and tag managers create. Its content is the same
+    // on every load, but its blob: URL contains a new random UUID each time. It talks only to its
+    // own page origin.
+    var code = 'fetch("' + location.origin + '/ping");';
+    var s = document.createElement("script");
+    s.src = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
+    document.head.appendChild(s);
+  </script>
+</head>
+<body><h1>Blob loader</h1></body>
+</html>
