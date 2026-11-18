@@ -38,6 +38,9 @@ export function scriptHost(url) {
   }
 }
 
+/** The sites.yml ignore pattern (a substring of the script URL) that matches `url`, if any. */
+export const ignoredBy = (url, ignore = []) => (url ? ignore.find((pattern) => url.includes(pattern)) : undefined);
+
 export function sameScriptContent(a, b) {
   return a?.hash === b.hash && JSON.stringify(a?.hashes) === JSON.stringify(b.hashes);
 }

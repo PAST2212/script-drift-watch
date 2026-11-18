@@ -140,8 +140,11 @@ A changed script without findings is listed as info.
 ### Script loads
 
 Chromium records the external script that initiated an HTTP(S) script request when it can
-attribute it. Each relationship uses the initiating script's normalized URL and the destination's
-exact origin (scheme, hostname and port). The report includes the observed child URL.
+attribute it. Code run through `eval`, `new Function` or a string timer counts as part of the
+script that ran it, so wrapping a loader in `eval` does not hide it. Each relationship uses the
+initiating script's normalized URL and the destination's exact origin (scheme, hostname and port).
+Runtime-generated `blob:` loaders count as one loader per page origin. The report includes the
+observed child URL.
 
 | Rule | Severity | Trigger |
 |---|---|---|
@@ -154,6 +157,9 @@ URLs, normalized like baseline script keys. Values are lists of HTTP(S) origins.
 forbids every attributable HTTP(S) script load by that loader, including same-origin requests.
 For an attributable redirected loader, policies on the original request URL and the final
 script URL both apply. The report shows both when they differ.
+A policy entry for a loader that the same site also ignores is rejected, because it could never
+apply. The report warns about policy entries that matched no script on the page, for example after
+a vendor moved its loader to a new path or version.
 
 ```yaml
 sites:
@@ -214,7 +220,11 @@ that a trusted vendor script gaining clipper/skimmer traits does not go unnotice
   receive the usual content checks. If one URL returns multiple bodies, or a body on one request
   and a failed request on another, the scanner reports the ambiguity. It checks available editions
   for content findings and attributes a clipper to a loader only when the child body is identifiable.
-  Origin policies still apply to requests with a verified initiator. Load rules honor URL ignore patterns on either end.
+  Origin policies still apply to requests with a verified initiator. A request made through a
+  helper function defined in another script (for example a site-wide `loadScript()`) is
+  attributed to that helper's script, so a policy on the calling script does not cover it.
+  Load rules honor URL ignore patterns on either end: ignoring a tag manager because its own
+  content changes often also turns off load monitoring for every script it injects.
 - **Baseline moves on.** After an alarm the baseline is updated, so the issue is your record.
   With `commit-baseline: false` you must commit an initial `baseline.json` yourself (e.g. made with
   the CLI), otherwise every run is a first run; the action warns about this.

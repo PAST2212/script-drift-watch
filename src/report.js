@@ -74,6 +74,9 @@ export function buildReport(results, { pruned = [], stale = [] } = {}) {
     if (r.ambiguousUrls?.length) {
       out.push(`Multiple response bodies or delivery outcomes for the same URL. Individual responses could not be attributed to a loader: ${r.ambiguousUrls.map(code).join(", ")}`, "");
     }
+    if (r.unmatchedPolicies?.length) {
+      out.push(`⚠️ \`allowed-script-origins\` entries that matched no script on this page, so their policy does not apply (check the loader URL): ${r.unmatchedPolicies.map(code).join(", ")}`, "");
+    }
     const loads = r.loadFindings ?? [];
     if (loads.length) {
       out.push("### Script load findings", "");

@@ -26,13 +26,44 @@ export function desktopUserAgent(version) {
   return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
 }
 
+/**
+ * Await every queued body read, including reads queued while waiting (a late response).
+ * Promise.all alone only covers the reads queued when it was called.
+ */
+export async function drainPending(pending) {
+  while (pending.length) await Promise.all(pending.splice(0));
+}
+
+/** Async stack depth the debugger records, so string timers and promise callbacks keep their caller. */
+const ASYNC_STACK_DEPTH = 8;
+
+/**
+ * The innermost stack frame that belongs to an external script. Frames of eval'd, Function-built
+ * or string-timer code have no script URL (or only a self-chosen sourceURL label), so walk outward,
+ * including async parents, to the script that ran that code. Inline page code is skipped too.
+ */
+function parentFromStack(stack, sourceUrls, documentURL) {
+  for (let s = stack; s; s = s.parent) {
+    for (const frame of s.callFrames ?? []) {
+      const url = sourceUrls.has(frame.scriptId) ? sourceUrls.get(frame.scriptId) : frame.url;
+      if (url && url !== documentURL) return url;
+    }
+  }
+  return null;
+}
+
 // Keep the browser's attributed parent for each request, including every hop of a redirect.
 // An HTML parser or inline script does not identify an external parent script.
-async function observeInitiators(session, record) {
+export async function observeInitiators(session, record) {
   const requests = new Map();
   const sourceUrls = new Map();
   session.on("Debugger.scriptParsed", ({ scriptId, hasSourceURL, embedderName }) => {
     if (hasSourceURL) sourceUrls.set(scriptId, embedderName || null);
+  });
+  // Deactivated breakpoints do not always hold: after a cross-process navigation Chromium can pause
+  // on `debugger;` (seen in about 1 of 25 runs), which would hang the page until the scan times out.
+  session.on("Debugger.paused", () => {
+    session.send("Debugger.resume").catch(() => {});
   });
   session.on("Network.requestWillBeSent", ({ requestId, type, request, initiator, redirectResponse, documentURL }) => {
     if (type !== "Script" || !/^https?:\/\//i.test(request.url)) return;
@@ -40,9 +71,8 @@ async function observeInitiators(session, record) {
     if (redirectResponse && requests.has(requestId)) {
       parent = requests.get(requestId);
     } else if (initiator.type === "script") {
-      const frame = initiator.stack?.callFrames[0];
-      parent = frame && sourceUrls.has(frame.scriptId) ? sourceUrls.get(frame.scriptId) : frame?.url || initiator.url;
-      if (!parent || parent === documentURL) parent = null;
+      parent = parentFromStack(initiator.stack, sourceUrls, documentURL)
+        ?? (initiator.url && initiator.url !== documentURL ? initiator.url : null);
     }
     requests.set(requestId, parent);
     record(request.url, parent);
@@ -51,6 +81,8 @@ async function observeInitiators(session, record) {
   await Promise.all([
     session.send("Debugger.enable"),
     session.send("Debugger.setBreakpointsActive", { active: false }),
+    session.send("Debugger.setSkipAllPauses", { skip: true }),
+    session.send("Debugger.setAsyncCallStackDepth", { maxDepth: ASYNC_STACK_DEPTH }),
     session.send("Network.enable"),
   ]);
 }
@@ -142,7 +174,7 @@ export async function collectScripts(browser, url, { timeoutMs, settleMs, userAg
     const loadTimedOut = await page.waitForLoadState("load", { timeout: timeoutMs }).then(() => false, () => true);
     if (!loadTimedOut) await page.waitForLoadState("networkidle", { timeout: timeoutMs }).catch(() => {});
     await page.waitForTimeout(settleMs);
-    await Promise.all(pending);
+    await drainPending(pending);
     const loads = [];
     for (const [url, parents] of attempts) {
       // A script stack can also name an inline/evaluated source. Attribute only captured scripts.

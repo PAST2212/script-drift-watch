@@ -1,4 +1,4 @@
-import { scriptKey } from "./diff.js";
+import { scriptKey, ignoredBy } from "./diff.js";
 
 // Policy is operator input. Observations in the baseline never grant permission.
 export function parseOriginPolicy(value, at, problems) {
@@ -49,12 +49,12 @@ function groupLoads(loads, policy, bodies, ignore, previous) {
   const groups = new Map();
   const unattributed = new Set();
   for (const { parentUrl, requestedParentUrl, url } of loads) {
-    if (ignore.some(p => url.includes(p) || parentUrl?.includes(p) || requestedParentUrl?.includes(p))) continue;
+    if ([url, parentUrl, requestedParentUrl].some((u) => ignoredBy(u, ignore))) continue;
     if (!parentUrl) {
       unattributed.add(scriptKey(url));
       continue;
     }
-    const source = scriptKey(parentUrl, bodies.get(parentUrl)?.hash);
+    const source = loaderKey(parentUrl);
     const parent = requestedParentUrl ? scriptKey(requestedParentUrl) : source;
     const origin = new URL(url).origin;
     const foreign = origin !== new URL(parentUrl).origin;
@@ -65,6 +65,27 @@ function groupLoads(loads, policy, bodies, ignore, previous) {
     groups.get(groupKey).requests.push({ url, source, foreign, governed });
   }
   return { groups, unattributed };
+}
+
+/** Deterministic string order (UTF-16 code units). localeCompare depends on the machine's ICU locale. */
+const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * A loader's identity. blob: loaders get one `blob:<page origin>` identity: their URL is random and
+ * their content may differ per load, and they can never carry a policy (keys are HTTP(S) URLs).
+ */
+const loaderKey = (url) => (url.startsWith("blob:") ? `blob:${new URL(url).origin}` : scriptKey(url));
+
+/**
+ * Policy entries whose loader was not requested on this page. Their policy silently does not
+ * apply, e.g. after the vendor moved the loader to a new path or version.
+ */
+export function unmatchedPolicies(policy = {}, loads = []) {
+  const seen = new Set();
+  for (const { url, parentUrl, requestedParentUrl } of loads) {
+    for (const u of [url, parentUrl, requestedParentUrl]) if (u && /^https?:/i.test(u)) seen.add(scriptKey(u));
+  }
+  return Object.keys(policy).filter((key) => !seen.has(key)).sort(byCodeUnit);
 }
 
 export function assessScriptLoads({ loads, previous, policy = {}, bodies, ignore = [] }) {
@@ -84,7 +105,7 @@ export function assessScriptLoads({ loads, previous, policy = {}, bodies, ignore
     origins[parent] ??= {};
     const old = origins[parent][origin];
     const state = {};
-    requests.sort((a, b) => a.url.localeCompare(b.url) || a.source.localeCompare(b.source));
+    requests.sort((a, b) => byCodeUnit(a.url, b.url) || byCodeUnit(a.source, b.source));
     const add = (id, severity, request, ongoing = false) => {
       const f = { id, severity, parent, child: request.url, ongoing };
       if (request.source !== parent) f.resolvedParent = request.source;
@@ -111,6 +132,6 @@ export function assessScriptLoads({ loads, previous, policy = {}, bodies, ignore
     }
     origins[parent][origin] = state;
   }
-  findings.sort((a, b) => a.parent.localeCompare(b.parent) || a.child.localeCompare(b.child) || a.id.localeCompare(b.id));
+  findings.sort((a, b) => byCodeUnit(a.parent, b.parent) || byCodeUnit(a.child, b.child) || byCodeUnit(a.id, b.id));
   return { origins, findings, unattributed: [...unattributed] };
 }
