@@ -44,8 +44,9 @@ arguments in `args` (an unknown option, `--settle-ms 5s` instead of `5000`) are 
 
 **2.** Add `.github/workflows/script-drift-watch.yml`:
 
-Replace `OWNER/script-drift-watch@v1` with the repository and tag or commit that contain your
-copy of the Action. For a checkout of the scanner repository itself, use `uses: ./` after checkout.
+The Action is published at `PAST2212/script-drift-watch`. Until a `v1` release tag exists, pin a
+commit SHA instead of `@v1` (safer than `@main`). If you run your own fork, use your account
+instead. For a checkout of the scanner repository itself, use `uses: ./` after checkout.
 
 ```yaml
 name: Script Drift Watch
@@ -64,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: OWNER/script-drift-watch@v1
+      - uses: PAST2212/script-drift-watch@v1
         with:
           config: sites.yml
 ```
