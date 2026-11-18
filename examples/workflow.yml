@@ -1,5 +1,5 @@
 # Copy to .github/workflows/script-drift-watch.yml in the repository that
-# holds your sites.yml. Replace OWNER with the GitHub user/org hosting the action.
+# holds your sites.yml. Until a v1 release tag exists, pin a commit SHA instead of @v1.
 name: Script Drift Watch
 
 on:
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: OWNER/script-drift-watch@v1
+      - uses: PAST2212/script-drift-watch@v1
         with:
           config: sites.yml
           baseline: baseline.json
