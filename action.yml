@@ -111,7 +111,7 @@ runs:
 
     - name: Commit baseline
       id: commit
-      if: ${{ !cancelled() && steps.scan.outcome == 'success' && inputs.commit-baseline == 'true' }}
+      if: ${{ !cancelled() && steps.scan.outcome == 'success' && steps.issue.outcome != 'failure' && inputs.commit-baseline == 'true' }}
       shell: bash
       env:
         INPUT_BASELINE: ${{ inputs.baseline }}

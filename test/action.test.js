@@ -75,7 +75,7 @@ before(async () => {
   await git("remote", "add", "origin", remote);
   await git("push", "-q", "-u", "origin", "main");
   await mkdir(bin);
-  await writeFile(join(bin, "gh"), `#!/bin/bash\nprintf '%s\\n' "$@" >> "${ghLog}"\nprintf 'GH_TOKEN=%s\\n' "$GH_TOKEN" >> "${ghLog}"\n`);
+  await writeFile(join(bin, "gh"), `#!/bin/bash\nprintf '%s\\n' "$@" >> "${ghLog}"\nprintf 'GH_TOKEN=%s\\n' "$GH_TOKEN" >> "${ghLog}"\nexit "\${TEST_GH_EXIT_CODE:-0}"\n`);
   await chmod(join(bin, "gh"), 0o755);
   await mkdir(join(tmp, "runner"));
   envBase = {
@@ -98,9 +98,9 @@ const ctx = (outputs) => ({
 const evalExpr = (v, c) => String(v).replace(/\$\{\{\s*([\w.-]+)\s*\}\}/g, (_, k) => c[k] ?? "");
 
 let lastStdout = "";
-async function runStep(id, outputs = {}, extraCtx = {}) {
+async function runStep(id, outputs = {}, extraCtx = {}, runnerEnv = {}) {
   const s = step(id);
-  const env = { ...envBase };
+  const env = { ...envBase, ...runnerEnv };
   for (const [k, v] of Object.entries(s.env ?? {})) env[k] = evalExpr(v, { ...ctx(outputs), ...extraCtx });
   try {
     ({ stdout: lastStdout } = await exec("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", s.run], { cwd: ws, env }));
@@ -224,4 +224,126 @@ test("I7: runtime dependencies are pinned exactly, locked with integrity hashes,
     assert.match(locked?.integrity ?? "", /^sha512-/, `${name} integrity`);
   }
   assert.match(step("install").run, /npm ci\b[^\n]*--ignore-scripts/);
+});
+
+// Evaluate the checked-in step condition before invoking its shell. Fail on unfamiliar syntax.
+function shouldRun(id, out, outcomes = {}) {
+  const values = { ...ctx(out), "inputs.open-issue": action.inputs["open-issue"].default, ...outcomes };
+  const terms = step(id).if.replace(/^\s*\$\{\{\s*|\s*\}\}\s*$/g, "").split(/\s*&&\s*/);
+  return terms.map((term) => {
+    if (term === "!cancelled()") return true;
+    const match = /^([\w.-]+)\s*(==|!=)\s*'([^']*)'$/.exec(term);
+    assert.ok(match && Object.hasOwn(values, match[1]), `unsupported ${id} condition: ${term}`);
+    const equal = values[match[1]] === match[3];
+    return match[2] === "==" ? equal : !equal;
+  }).every(Boolean);
+}
+
+test("an unknown-domain clipper opens one issue while legitimate vendor updates stay quiet", async (t) => {
+  let vendorVersion = 1;
+  let childUrl = "";
+  // .localhost hostnames resolve to loopback in Chromium; the bodies only contain inert markers.
+  const site = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname === "/") {
+      res.writeHead(200, { "content-type": "text/html" });
+      return res.end(`<!doctype html><html data-experiment="${childUrl}"><script src="${loaderUrl}"></script></html>`);
+    }
+    if (url.pathname === "/vendor.js") {
+      res.writeHead(200, { "content-type": "text/javascript" });
+      return res.end(`/* release ${vendorVersion} */ const target = document.documentElement.dataset.experiment;
+        if (target) { const script = document.createElement("script"); script.src = target; document.head.append(script); }`);
+    }
+    if (url.pathname === "/experiment.js") {
+      res.writeHead(200, { "content-type": "text/javascript" });
+      return res.end(url.hostname === "unseen.localhost"
+        ? '/* signature fixture: navigator.clipboard.writeText( "0x0000000000000000000000000000000000000000" */'
+        : '/* harmless experiment */');
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => site.listen(0, "127.0.0.1", resolve));
+  t.after(() => site.close());
+  const port = site.address().port;
+  const pageUrl = `http://shop.localhost:${port}/`;
+  const loaderUrl = `http://vendor.localhost:${port}/vendor.js`;
+  const partnerUrl = `http://partner.localhost:${port}/experiment.js`;
+  const unseenUrl = `http://unseen.localhost:${port}/experiment.js`;
+  await writeFile(join(ws, "load-chain.yml"), YAML.stringify({ sites: [pageUrl] }));
+  const config = { "inputs.config": "load-chain.yml", "inputs.baseline": "load-chain-baseline.json" };
+
+  async function issueLog() {
+    try {
+      return await readFile(ghLog, "utf8");
+    } catch (e) {
+      if (e.code === "ENOENT") return "";
+      throw e;
+    }
+  }
+  const earlierCalls = await issueLog();
+  async function scan(expectedExit, expectedIssues) {
+    assert.equal(await runStep("scan", {}, config), 0, lastStdout);
+    const out = await outputs();
+    const report = await readFile(out.report, "utf8");
+    if (shouldRun("issue", out)) assert.equal(await runStep("issue", out), 0, lastStdout);
+    assert.equal(out["exit-code"], expectedExit, report);
+    const calls = (await issueLog()).slice(earlierCalls.length);
+    assert.equal((calls.match(/^issue\ncreate$/gm) ?? []).length, expectedIssues, calls);
+    return report;
+  }
+
+  assert.match(await scan("0", 0), /Baseline created/);
+  vendorVersion++;
+  const release = await scan("0", 0);
+  assert.ok(release.includes(`Changed: \`${loaderUrl}\``), release);
+
+  childUrl = partnerUrl;
+  const experiment = await scan("0", 0);
+  await t.test("a new benign destination is reported at medium severity", () => {
+    assert.ok(experiment.includes("new-script-origin"), experiment);
+    assert.match(experiment, /medium/i);
+    assert.ok(experiment.includes(partnerUrl), experiment);
+  });
+
+  childUrl = unseenUrl;
+  await scan("2", 1);
+  const calls = (await issueLog()).slice(earlierCalls.length);
+  const bodyArg = calls.match(/^--body-file\n([^\n]+)/m);
+  assert.ok(bodyArg, calls);
+  const body = await readFile(bodyArg[1], "utf8");
+  await t.test("the high issue contains the actual loader and its clipper destination", () => {
+    assert.match(body, /clipper-script-load/);
+    assert.match(body, /high-severity/);
+    assert.ok(body.split("\n").some((line) => line.includes(loaderUrl) && line.includes(unseenUrl)), body);
+    assert.doesNotMatch(body, /known-ioc/);
+  });
+
+  const repeated = await scan("0", 1);
+  await t.test("the same outstanding incident stays visible", () => {
+    assert.match(repeated, /Still observed/i);
+    assert.ok(repeated.includes(unseenUrl), repeated);
+  });
+});
+
+test("a failed issue leaves the remote baseline available for retry", async () => {
+  const baseline = "retry-baseline.json";
+  const report = join(envBase.RUNNER_TEMP, "retry-report.md");
+  const out = { "exit-code": "2", report };
+  await writeFile(report, "# Local test alarm\n");
+  await writeFile(join(ws, baseline), "{}\n");
+  const canCommit = (issueOutcome) => shouldRun("commit", out, {
+    "steps.scan.outcome": "success", "steps.issue.outcome": issueOutcome,
+  });
+  const remoteEntry = async () => (await exec("git", ["--git-dir", remote, "ls-tree", "--name-only", "main", "--", baseline])).stdout.trim();
+  const config = { "inputs.baseline": baseline };
+
+  assert.equal(await runStep("issue", out, {}, { TEST_GH_EXIT_CODE: "1" }), 1);
+  if (canCommit("failure")) assert.equal(await runStep("commit", out, config), 0);
+  assert.equal(await remoteEntry(), "", "failed gh issue creation advanced the remote baseline");
+
+  assert.equal(await runStep("issue", out), 0);
+  assert.ok(canCommit("success"));
+  assert.equal(await runStep("commit", out, config), 0);
+  assert.equal(await remoteEntry(), baseline);
+  assert.ok(canCommit("skipped"), "a skipped issue should allow ordinary baseline updates");
 });

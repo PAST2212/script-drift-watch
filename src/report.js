@@ -30,6 +30,8 @@ export function buildErrorReport(message) {
  * @param {{site:string, error?:string, firstRun:boolean, warnings?:string[],
  *          diff:{added:string[],changed:string[],removed:string[]},
  *          findings:Record<string,Finding[]>,   // fresh: alarm-relevant
+ *          loadFindings?:{parent:string,resolvedParent?:string,child:string,id:string,severity:string,ongoing:boolean}[],
+ *          unattributed?:string[], ambiguousUrls?:string[],
  *          known?:Record<string,Finding[]>}[]} results   // traits the host already had (info)
  * @param {{pruned?:string[], stale?:string[]}} [options]  sites no longer in sites.yml: dropped from
  *   the baseline (pruned, with --update-baseline) or still kept in it (stale, without the flag)
@@ -39,6 +41,7 @@ export function buildReport(results, { pruned = [], stale = [] } = {}) {
   let highCount = 0;
   let findingCount = 0;
   let errorCount = 0;
+  let ongoingCount = 0;
   const out = ["# Script Drift Watch report", ""];
 
   const renderScript = (label, key, fresh, known) => {
@@ -68,9 +71,27 @@ export function buildReport(results, { pruned = [], stale = [] } = {}) {
     }
     const fresh = r.findings ?? {};
     const known = r.known ?? {};
+    if (r.ambiguousUrls?.length) {
+      out.push(`Multiple response bodies or delivery outcomes for the same URL. Individual responses could not be attributed to a loader: ${r.ambiguousUrls.map(code).join(", ")}`, "");
+    }
+    const loads = r.loadFindings ?? [];
+    if (loads.length) {
+      out.push("### Script load findings", "");
+      for (const f of loads) {
+        if (f.ongoing) ongoingCount++;
+        else {
+          findingCount++;
+          if (f.severity === "high") highCount++;
+        }
+        const label = f.ongoing ? "Still observed" : f.severity;
+        const loader = f.resolvedParent ? `${code(f.parent)} (resolved to ${code(f.resolvedParent)})` : code(f.parent);
+        out.push(`- ${ICON[f.severity]} **${label}** ${code(f.id)}: ${loader} → ${code(f.child)}`);
+      }
+      out.push("");
+    }
 
     if (r.firstRun) {
-      out.push(`✅ Baseline created with ${r.diff.added.length} script(s). No alarms on the first run except known IoCs.`, "");
+      out.push(`Baseline created with ${r.diff.added.length} script(s). Known IoCs and explicit origin policy violations can alarm on this run.`, "");
       for (const key of r.diff.added) {
         if (fresh[key]?.length || known[key]?.length) renderScript("Recorded", key, fresh[key] ?? [], known[key] ?? []);
       }
@@ -79,12 +100,15 @@ export function buildReport(results, { pruned = [], stale = [] } = {}) {
 
     const { added, changed, removed } = r.diff;
     if (!added.length && !changed.length && !removed.length) {
-      out.push("No changes.", "");
+      if (!loads.length) out.push("No changes.", "");
       continue;
     }
     for (const [label, keys] of [["New", added], ["Changed", changed]]) {
       for (const key of keys) renderScript(label, key, fresh[key] ?? [], known[key] ?? []);
     }
+    const unattributed = new Set(r.unattributed);
+    const unknown = [...added, ...changed].filter(key => unattributed.has(key));
+    if (unknown.length) out.push(`External initiator unknown or loaded by page markup: ${unknown.map(code).join(", ")}`, "");
     if (removed.length) out.push(`Removed: ${removed.map(code).join(", ")}`, "");
   }
 
@@ -99,6 +123,7 @@ export function buildReport(results, { pruned = [], stale = [] } = {}) {
   const headline = [];
   if (highCount) headline.push(`**${highCount} high-severity finding(s)** – review the scripts below now.`);
   else if (findingCount) headline.push(`${findingCount} medium-severity finding(s).`);
+  if (ongoingCount) headline.push(`${ongoingCount} previously reported high-severity script load(s) still observed.`);
   if (errorCount) headline.push(`⚠️ ${errorCount} site(s) could not be scanned.`);
   if (!headline.length) headline.push("No suspicious findings.");
   out.splice(2, 0, headline.join(" "), "");

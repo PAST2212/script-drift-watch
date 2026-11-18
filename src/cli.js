@@ -2,9 +2,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import YAML, { LineCounter } from "yaml";
 import { scanScript } from "./rules.js";
-import { scriptKey, scriptHost, diffSite } from "./diff.js";
+import { scriptKey, scriptHost, diffSite, sameScriptContent } from "./diff.js";
 import { buildReport, buildErrorReport } from "./report.js";
 import { collectScripts, launchBrowser, IPHONE_UA } from "./collect.js";
+import { assessScriptLoads, parseOriginPolicy } from "./loads.js";
 
 const USAGE = `Usage: script-drift-watch [options]
 
@@ -19,7 +20,7 @@ const USAGE = `Usage: script-drift-watch [options]
 
 Exit codes: 0 = ok/info, 2 = high-severity finding, 1 = error`;
 
-const SITE_KEYS = ["url", "ignore", "ios"];
+const SITE_KEYS = ["url", "ignore", "ios", "allowed-script-origins"];
 
 function editDistance(a, b) {
   let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
@@ -107,7 +108,11 @@ export function parseSites(text) {
     if (entry.ios !== undefined && typeof entry.ios !== "boolean") {
       problems.push(`${at}: ios must be true or false, got ${JSON.stringify(entry.ios)}`);
     }
-    return { url: String(entry.url), ignore: Array.isArray(ignore) ? ignore.map(String) : [], ios: entry.ios === true };
+    const site = { url: String(entry.url), ignore: Array.isArray(ignore) ? ignore.map(String) : [], ios: entry.ios === true };
+    if (Object.hasOwn(entry, "allowed-script-origins")) {
+      site.allowedScriptOrigins = parseOriginPolicy(entry["allowed-script-origins"], at, problems);
+    }
+    return site;
   });
   if (problems.length) {
     throw new Error(`the sites list has ${problems.length} problem(s):\n${problems.map((p) => `  - ${p}`).join("\n")}`);
@@ -178,7 +183,8 @@ export function mergeTraits(oldTraits, findingsByKey) {
 export function stableScripts(oldScripts, scripts) {
   const out = {};
   for (const key of Object.keys(scripts).sort()) {
-    out[key] = oldScripts?.[key]?.hash === scripts[key].hash ? oldScripts[key] : scripts[key];
+    const old = oldScripts?.[key];
+    out[key] = old && sameScriptContent(old, scripts[key]) ? { ...scripts[key], url: old.url } : scripts[key];
   }
   return out;
 }
@@ -202,29 +208,65 @@ async function readBaseline(path) {
   }
 }
 
-async function scanTarget(browser, target, oldEntry, opts) {
-  const { site, url, ignore, userAgent } = target;
-  try {
-    const { scripts: collected, loadTimedOut } = await collectScripts(browser, url, { ...opts, userAgent });
-    const scripts = {};
-    const contents = {};
-    for (const s of collected) {
-      if (ignore.some((pattern) => s.url.includes(pattern))) continue;
-      const key = scriptKey(s.url, s.hash);
-      scripts[key] = { hash: s.hash, url: s.url };
-      contents[key] = s;
+function inspectScripts(collected, ambiguousUrls, ignore, oldEntry) {
+  const grouped = new Map();
+  for (const s of collected) {
+    if (ignore.some(pattern => s.url.includes(pattern))) continue;
+    const key = scriptKey(s.url, s.hash);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(s);
+  }
+  const scripts = {};
+  const bodies = new Map();
+  const all = {};
+  for (const [key, responses] of grouped) {
+    const editions = new Map(responses.map(s => [s.hash, s]));
+    const hashes = [...editions.keys()].sort();
+    const hash = hashes[0];
+    const entry = { hash, url: editions.get(hash).url };
+    if (hashes.length > 1) entry.hashes = hashes;
+    const old = oldEntry?.scripts?.[key];
+    const changed = !old || !sameScriptContent(old, entry);
+    const clippers = new Set();
+    // Legacy baselines lack cached clipper evidence. For multiple editions the
+    // exact body matters, even when their combined inventory stayed the same.
+    if (changed || oldEntry?.loadOrigins === undefined || hashes.length > 1) {
+      const found = new Map();
+      for (const digest of hashes) {
+        const s = editions.get(digest);
+        for (const f of scanScript(s.content, scriptHost(s.url))) {
+          if (f.id === "clipboard-hijack") clippers.add(digest);
+          found.set(f.id, f);
+        }
+      }
+      if (changed && found.size) all[key] = [...found.values()];
+    } else if (old.clipper) {
+      clippers.add(hash);
     }
+    if (clippers.size) entry.clipper = true;
+    scripts[key] = entry;
+    for (const s of responses) bodies.set(s.url, { hash: s.hash, clipper: clippers.has(s.hash) });
+  }
+  for (const url of ambiguousUrls) bodies.delete(url);
+  return { scripts, bodies, all };
+}
+
+async function scanTarget(browser, target, oldEntry, opts) {
+  const { site, url, ignore, userAgent, allowedScriptOrigins } = target;
+  try {
+    const { scripts: collected, ambiguousUrls = [], loads, loadTimedOut } = await collectScripts(browser, url, { ...opts, userAgent });
+    const { scripts, bodies, all } = inspectScripts(collected, ambiguousUrls, ignore, oldEntry);
     const firstRun = oldEntry === undefined;
     const diff = diffSite(oldEntry?.scripts, scripts);
-    const all = {};
-    for (const key of firstRun ? Object.keys(scripts) : [...diff.added, ...diff.changed]) {
-      const found = scanScript(contents[key].content, scriptHost(contents[key].url));
-      if (found.length) all[key] = found;
-    }
     const { fresh, known } = classifyFindings(all, oldEntry?.traits, firstRun);
-    const entry = { scripts: stableScripts(oldEntry?.scripts, scripts), traits: mergeTraits(oldEntry?.traits, all) };
+    const graph = assessScriptLoads({ loads, previous: oldEntry?.loadOrigins, policy: allowedScriptOrigins, bodies, ignore });
+    const entry = { scripts: stableScripts(oldEntry?.scripts, scripts), traits: mergeTraits(oldEntry?.traits, all), loadOrigins: graph.origins };
     const warnings = loadTimedOut ? ["load-timeout"] : [];
-    return { site, firstRun, diff, findings: fresh, known, warnings, entry };
+    return {
+      site, firstRun, diff, findings: fresh, known, warnings, entry,
+      loadFindings: graph.findings, unattributed: graph.unattributed,
+      ambiguousUrls: ambiguousUrls.filter(child => !ignore.some(pattern => child.includes(pattern))),
+    };
   } catch (e) {
     return { site, firstRun: false, error: e.message.split("\n")[0], diff: { added: [], changed: [], removed: [] }, findings: {}, entry: null };
   }
@@ -291,8 +333,8 @@ export async function main(argv) {
   }
 
   const targets = sites.flatMap((s) => [
-    { site: s.url, url: s.url, ignore: s.ignore },
-    ...(s.ios ? [{ site: `${s.url} [iPhone]`, url: s.url, ignore: s.ignore, userAgent: IPHONE_UA }] : []),
+    { ...s, site: s.url },
+    ...(s.ios ? [{ ...s, site: `${s.url} [iPhone]`, userAgent: IPHONE_UA }] : []),
   ]);
   const opts = { timeoutMs: Number(args["timeout-ms"]), settleMs: Number(args["settle-ms"]) };
 

@@ -26,11 +26,57 @@ export function desktopUserAgent(version) {
   return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
 }
 
+// Keep the browser's attributed parent for each request, including every hop of a redirect.
+// An HTML parser or inline script does not identify an external parent script.
+async function observeInitiators(session, record) {
+  const requests = new Map();
+  const sourceUrls = new Map();
+  session.on("Debugger.scriptParsed", ({ scriptId, hasSourceURL, embedderName }) => {
+    if (hasSourceURL) sourceUrls.set(scriptId, embedderName || null);
+  });
+  session.on("Network.requestWillBeSent", ({ requestId, type, request, initiator, redirectResponse, documentURL }) => {
+    if (type !== "Script" || !/^https?:\/\//i.test(request.url)) return;
+    let parent = null;
+    if (redirectResponse && requests.has(requestId)) {
+      parent = requests.get(requestId);
+    } else if (initiator.type === "script") {
+      const frame = initiator.stack?.callFrames[0];
+      parent = frame && sourceUrls.has(frame.scriptId) ? sourceUrls.get(frame.scriptId) : frame?.url || initiator.url;
+      if (!parent || parent === documentURL) parent = null;
+    }
+    requests.set(requestId, parent);
+    record(request.url, parent);
+  });
+  // The debugger supplies initiator stacks. Pages containing a debugger statement must keep running.
+  await Promise.all([
+    session.send("Debugger.enable"),
+    session.send("Debugger.setBreakpointsActive", { active: false }),
+    session.send("Network.enable"),
+  ]);
+}
+
+// Chromium can name the requested URL in a call frame even when Playwright delivered
+// the script body at the end of a redirect chain. Only retain unambiguous identities.
+function rememberRedirectChain(sources, request) {
+  const chain = [];
+  for (let hop = request; hop; hop = hop.redirectedFrom()) chain.push(hop.url());
+  const parentUrl = chain[0];
+  const requestedParentUrl = chain.at(-1);
+  for (const alias of chain) {
+    const previous = sources.get(alias);
+    sources.set(alias, {
+      parentUrl: previous && previous.parentUrl !== parentUrl ? null : parentUrl,
+      requestedParentUrl: previous && previous.requestedParentUrl !== requestedParentUrl ? null : requestedParentUrl,
+    });
+  }
+}
+
 /**
  * @param {import('playwright').Browser} browser
  * @param {string} url
  * @param {{timeoutMs:number, settleMs:number, userAgent?:string}} opts
- * @returns {Promise<{scripts:{url:string, content:string, hash:string}[], loadTimedOut:boolean}>}
+ * @returns {Promise<{scripts:{url:string, content:string, hash:string}[], ambiguousUrls:string[],
+ *   loads:{parentUrl:string|null,requestedParentUrl?:string,url:string}[], loadTimedOut:boolean}>}
  *   Throws only when the main document itself fails (network error or non-2xx status).
  */
 export async function collectScripts(browser, url, { timeoutMs, settleMs, userAgent }) {
@@ -42,13 +88,48 @@ export async function collectScripts(browser, url, { timeoutMs, settleMs, userAg
   });
   const pending = [];
   const scripts = new Map();
+  const sources = new Map();
+  const attempts = new Map();
+  const unreadRequests = new Set();
+  const record = (url, parent) => {
+    if (!attempts.has(url)) attempts.set(url, new Set());
+    if (parent !== undefined) attempts.get(url).add(parent);
+  };
   try {
     const page = await context.newPage();
+    page.on("request", (req) => {
+      // Playwright also sees requests from out-of-process frames before a CDP session can attach.
+      if (req.resourceType() === "script" && /^https?:\/\//i.test(req.url())) {
+        record(req.url());
+        unreadRequests.add(req);
+      }
+    });
+    await observeInitiators(await context.newCDPSession(page), record);
+    const observedFrames = new WeakSet();
+    page.on("framenavigated", async (frame) => {
+      if (frame === page.mainFrame() || observedFrames.has(frame)) return;
+      observedFrames.add(frame);
+      try {
+        const session = await context.newCDPSession(frame);
+        session.once("close", () => observedFrames.delete(frame));
+        await observeInitiators(session, record);
+      } catch {
+        // Same-process frames share the page's session. A detaching frame may have no session.
+        observedFrames.delete(frame);
+      }
+    });
     page.on("response", (res) => {
       if (res.request().resourceType() !== "script" || res.status() >= 300) return;
       pending.push(
         res.text().then(
-          (content) => scripts.set(res.url(), { url: res.url(), content, hash: sha256(content) }),
+          (content) => {
+            const url = res.url();
+            const hash = sha256(content);
+            if (!scripts.has(url)) scripts.set(url, new Map());
+            scripts.get(url).set(hash, { url, content, hash });
+            unreadRequests.delete(res.request());
+            rememberRedirectChain(sources, res.request());
+          },
           () => {}, // body unavailable (aborted/redirected) – skip
         ),
       );
@@ -62,7 +143,25 @@ export async function collectScripts(browser, url, { timeoutMs, settleMs, userAg
     if (!loadTimedOut) await page.waitForLoadState("networkidle", { timeout: timeoutMs }).catch(() => {});
     await page.waitForTimeout(settleMs);
     await Promise.all(pending);
-    return { scripts: [...scripts.values()], loadTimedOut };
+    const loads = [];
+    for (const [url, parents] of attempts) {
+      // A script stack can also name an inline/evaluated source. Attribute only captured scripts.
+      if (!parents.size) parents.add(null);
+      for (const raw of parents) {
+        const source = sources.get(raw);
+        const parentUrl = source?.parentUrl ?? null;
+        const edge = { url, parentUrl };
+        if (parentUrl && source.requestedParentUrl && source.requestedParentUrl !== parentUrl) {
+          edge.requestedParentUrl = source.requestedParentUrl;
+        }
+        loads.push(edge);
+      }
+    }
+    // A body from one frame cannot establish what another loader received at the
+    // same URL when that other request failed, redirected, or never finished.
+    const unreadUrls = new Set([...unreadRequests].map(req => req.url()));
+    const ambiguousUrls = [...scripts.keys()].filter(url => scripts.get(url).size > 1 || unreadUrls.has(url)).sort();
+    return { scripts: [...scripts.values()].flatMap(variants => [...variants.values()]), ambiguousUrls, loads, loadTimedOut };
   } finally {
     await context.close();
   }
