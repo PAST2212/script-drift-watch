@@ -15,7 +15,7 @@ export const KNOWN_IOCS = [
  * so `attacker.cloudfront.net` is foreign to a script served from `vendor.cloudfront.net`.
  */
 const SHARED_HOSTING_SUFFIXES = [
-  "cloudfront.net", "s3.amazonaws.com", "azureedge.net", "azurewebsites.net", "blob.core.windows.net",
+  "cloudfront.net", "azureedge.net", "azurewebsites.net", "blob.core.windows.net",
   "web.app", "firebaseapp.com", "appspot.com", "workers.dev", "pages.dev", "r2.dev", "trycloudflare.com",
   "github.io", "githubusercontent.com", "netlify.app", "vercel.app", "herokuapp.com", "onrender.com",
   "fly.dev", "glitch.me", "surge.sh", "ngrok.io", "ngrok-free.app", "b-cdn.net", "myshopify.com",
@@ -33,6 +33,8 @@ const CCTLD_SECOND_LEVELS = new Set([
 export function registrableDomain(host) {
   const h = String(host).toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(":")) return h;
+  // AWS nests tenants at varying depths (bucket.s3.eu-west-1…, id.execute-api.us-east-1…): whole host.
+  if (h.endsWith(".amazonaws.com")) return h;
   const parts = h.split(".");
   const shared = SHARED_HOSTING_SUFFIXES.find((s) => h.endsWith(`.${s}`));
   if (shared) return parts.slice(-(shared.split(".").length + 1)).join(".");
@@ -69,7 +71,9 @@ function firstMatch(content, re) {
 }
 
 const RE = {
-  clipboard: /navigator\.clipboard\.(?:writeText|readText|write|read)\s*\(|clipboardData\.(?:setData|getData)\s*\(|addEventListener\(\s*["'`](?:copy|cut|paste)["'`]|\.oncopy\s*=|execCommand\s{0,16}\(\s{0,16}["'`](?:copy|cut|paste)["'`]/,
+  clipboard: /navigator\.clipboard\.(?:writeText|readText|write|read)\s*\(|clipboardData\.(?:setData|getData)\s*\(|addEventListener\(\s*["'`](?:copy|cut|paste)["'`]|\.oncopy\s*=/,
+  // Browsers treat execCommand names case-insensitively ("Copy" works), so this one is /i.
+  execCopy: /execCommand\s{0,16}\(\s{0,16}["'`](?:copy|cut|paste)["'`]/i,
   wallet: new RegExp(
     [
       // Boundaries exclude base64 characters so blobs (fonts, images) don't match.
@@ -81,12 +85,13 @@ const RE = {
     ].join("|"),
   ),
   atob: /\batob\s*\(/g,
-  // eval(, new Function(, Function(atob, indirect eval (0,eval)( and window["eval"](,
-  // and string timers fed straight from atob: setTimeout(atob(…)).
-  dynamicCode: /\beval\s*\(|\bnew\s+Function\s*\(|\bFunction\s*\(\s*atob|\(\s{0,16}\d{1,4}\s{0,16},\s{0,16}eval\s{0,16}\)\s{0,16}\(|\[\s{0,16}["'`]eval["'`]\s{0,16}\]\s{0,16}\(|\b(?:setTimeout|setInterval)\s{0,16}\(\s{0,16}atob\s{0,16}\(/g,
-  // Field names in strings, selectors and regexes ("cvc", [name=cvc], #cvc, /cvv|cvc/), not
-  // identifiers: no whitespace prefix (`new Cvc`, `return cvc`) and no call (`=Cvc(`).
-  cardField: /["'`\[=#/|](?:cc-number|cc-csc|cc-exp(?:-month|-year)?|cardnumber|card[-_]number|cvv2?|cvc)\b(?!\s{0,16}\()/i,
+  // eval(, new Function(, Function(atob, eval.call(/eval.apply(, indirect eval (0,eval)( and
+  // (0, window.eval)(, window["eval"](, and string timers fed straight from atob: setTimeout(atob(…)).
+  dynamicCode: /\beval\s*\(|\bnew\s+Function\s*\(|\bFunction\s*\(\s*atob|\beval\s{0,16}\.\s{0,16}(?:call|apply)\s{0,16}\(|\(\s{0,16}\d{1,4}\s{0,16},\s{0,16}(?:(?:window|self|globalThis)\s{0,16}\.\s{0,16})?eval\s{0,16}\)\s{0,16}\(|\[\s{0,16}["'`]eval["'`]\s{0,16}\]\s{0,16}\(|\b(?:setTimeout|setInterval)\s{0,16}\(\s{0,16}atob\s{0,16}\(/g,
+  // Field names in strings, selectors and regexes ("cvc", [name=cvc], #cvc, .cc-number, /^cvc$/,
+  // /cvv|cvc/), including Magento's underscore names (payment[cc_number], cc_cid, cc_exp_month).
+  // Not identifiers: no whitespace prefix (`new Cvc`, `return cvc`) and no call (`=Cvc(`).
+  cardField: /["'`\[=#/|.^](?:cc[-_]?(?:number|num|csc|cid|cvv|cvc|exp(?:[-_]?(?:month|year|date))?)|card[-_]?(?:number|num)|cvv2?|cvc)\b(?!\s{0,16}\()/i,
   inputHook: /(?:getOwnPropertyDescriptor|defineProperty)\s*\(\s*(?:window\.)?HTMLInputElement\.prototype\s*,\s*["'`]value["'`]/,
   iosDevice: /\b(?:iPhone|iPad|iPod)\b/,
   uaSniff: /navigator\.(?:userAgent|platform|maxTouchPoints)/,
@@ -106,7 +111,7 @@ export function scanScript(content, scriptHost) {
   const add = (id, severity, title, m) =>
     findings.push({ id, severity, title, evidence: snippet(src, m.index, m.length) });
 
-  const clip = firstMatch(src, RE.clipboard);
+  const clip = firstMatch(src, RE.clipboard) ?? firstMatch(src, RE.execCopy);
   const wallet = firstMatch(src, RE.wallet);
   if (clip && wallet) {
     add("clipboard-hijack", "high", "Clipboard access combined with crypto wallet addresses (clipper)", clip);

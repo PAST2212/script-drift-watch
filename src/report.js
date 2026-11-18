@@ -31,10 +31,11 @@ export function buildErrorReport(message) {
  *          diff:{added:string[],changed:string[],removed:string[]},
  *          findings:Record<string,Finding[]>,   // fresh: alarm-relevant
  *          known?:Record<string,Finding[]>}[]} results   // traits the host already had (info)
- * @param {{pruned?:string[]}} [options]  sites dropped from the baseline (no longer in sites.yml)
+ * @param {{pruned?:string[], stale?:string[]}} [options]  sites no longer in sites.yml: dropped from
+ *   the baseline (pruned, with --update-baseline) or still kept in it (stale, without the flag)
  * @returns {{markdown:string, exitCode:0|2, hasFindings:boolean, hasErrors:boolean}}
  */
-export function buildReport(results, { pruned = [] } = {}) {
+export function buildReport(results, { pruned = [], stale = [] } = {}) {
   let highCount = 0;
   let findingCount = 0;
   let errorCount = 0;
@@ -89,6 +90,10 @@ export function buildReport(results, { pruned = [] } = {}) {
 
   if (pruned.length) {
     out.push("## No longer in sites.yml", "", `Baseline entries dropped: ${pruned.map(code).join(", ")}`, "");
+  }
+  if (stale.length) {
+    out.push("## No longer in sites.yml", "",
+      `Still in the baseline (run with \`--update-baseline\` to drop them): ${stale.map(code).join(", ")}`, "");
   }
 
   const headline = [];

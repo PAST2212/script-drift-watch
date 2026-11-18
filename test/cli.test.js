@@ -98,6 +98,12 @@ test("a url without http(s):// is rejected with a hint", () => {
   assert.match(msg, /https:\/\//);
 });
 
+test("a url with spaces around it is rejected instead of being used as written", () => {
+  const msg = parseError('sites:\n  - url: " https://a.example/ "\n');
+  assert.match(msg, /sites\[0\]/);
+  assert.match(msg, /spaces/);
+});
+
 test("an entry that is neither a URL nor a mapping with url is rejected", () => {
   assert.match(parseError("sites:\n  - 42\n"), /sites\[0\]/);
   assert.match(parseError("sites:\n  - [https://a.example/]\n"), /sites\[0\]/);
@@ -121,13 +127,13 @@ test("all problems in the config are reported at once", () => {
 });
 
 /** Runs the CLI against files in a temp dir; never reaches the browser for broken input. */
-async function runMain(t, files) {
+async function runMain(t, files, extra = []) {
   const dir = await mkdtemp(join(tmpdir(), "sdw-cli-"));
   for (const [name, content] of Object.entries(files)) await writeFile(join(dir, name), content);
   t.mock.method(console, "error", () => {});
   t.mock.method(console, "log", () => {});
   const code = await main(["--config", join(dir, "sites.yml"), "--baseline", join(dir, "baseline.json"),
-    "--report", join(dir, "report.md"), "--settle-ms", "0", "--timeout-ms", "2000"]);
+    "--report", join(dir, "report.md"), "--settle-ms", "0", "--timeout-ms", "2000", ...extra]);
   const report = await readFile(join(dir, "report.md"), "utf8").catch(() => "");
   return { code, report };
 }
@@ -143,6 +149,25 @@ test("a YAML syntax error names the config file in the report", async (t) => {
   const { code, report } = await runMain(t, { "sites.yml": "sites:\n  - url: https://a.example/\n   ios: true\n" });
   assert.equal(code, 1);
   assert.match(report, /sites\.yml/);
+});
+
+// ---- Review findings: CLI arguments (the Action passes its `args` input straight through) ----
+const SITES = { "sites.yml": "sites:\n  - https://a.example/\n" };
+
+test("a malformed --settle-ms or --timeout-ms is rejected instead of silently changing the scan", async (t) => {
+  for (const extra of [["--settle-ms", "5s"], ["--timeout-ms", "30s"], ["--timeout-ms", "0"], ["--settle-ms=-1"]]) {
+    const { code, report } = await runMain(t, SITES, extra);
+    assert.equal(code, 1, extra.join(" "));
+    assert.match(report, /did not run/i, extra.join(" "));
+    assert.match(report, extra[0].startsWith("--settle") ? /--settle-ms/ : /--timeout-ms/, extra.join(" "));
+  }
+});
+
+test("an unknown option exits 1 and the report names it and lists the valid options", async (t) => {
+  const { code, report } = await runMain(t, SITES, ["--settle", "5000"]);
+  assert.equal(code, 1);
+  assert.match(report, /'--settle'/);
+  assert.match(report, /--settle-ms <n>/);
 });
 
 test("an unreadable baseline exits 1 and explains the problem in the report", async (t) => {
@@ -177,10 +202,24 @@ test("known IoCs alarm even when already recorded for the host", () => {
   assert.deepEqual(fresh[PAY].map((f) => f.id), ["known-ioc"]);
 });
 
-test("trait memory for a blob: script is kept under the host of its page", () => {
-  const BLOB = "blob:https://shop.example/sha256-abcdef0123456789";
-  assert.deepEqual(classifyFindings({ [BLOB]: [F("clipboard-hijack")] }, { "shop.example": ["clipboard-hijack"] }, false).fresh, {});
-  assert.deepEqual(mergeTraits({}, { [BLOB]: [F("exfil-sink")] }), { "shop.example": ["exfil-sink"] });
+// Review finding: blob: scripts must not inherit the traits of the page's own scripts, or a skimmer
+// laundered through a blob on a checkout page (whose own code references card fields) is only info.
+const BLOB = "blob:https://shop.example/sha256-abcdef0123456789";
+
+test("a blob: script does not inherit the traits of the page's own scripts", () => {
+  const { fresh } = classifyFindings({ [BLOB]: [F("card-field-access")] }, { "shop.example": ["card-field-access"] }, false);
+  assert.deepEqual(fresh[BLOB]?.map((f) => f.id), ["card-field-access"]);
+});
+
+test("trait memory for blob: scripts is kept per page host in a separate blob: bucket", () => {
+  assert.deepEqual(classifyFindings({ [BLOB]: [F("card-field-access")] }, { "blob:shop.example": ["card-field-access"] }, false).fresh, {});
+  assert.deepEqual(mergeTraits({}, { [BLOB]: [F("exfil-sink")] }), { "blob:shop.example": ["exfil-sink"] });
+});
+
+test("blob: scripts from an opaque origin share one stable bucket instead of one per content", () => {
+  const traits = mergeTraits({}, { "blob:null/sha256-aaaaaaaaaaaaaaaa": [F("exfil-sink", "medium")] });
+  assert.deepEqual(traits, { "blob:null": ["exfil-sink"] });
+  assert.deepEqual(classifyFindings({ "blob:null/sha256-bbbbbbbbbbbbbbbb": [F("exfil-sink", "medium")] }, traits, false).fresh, {});
 });
 
 test("mergeTraits unions finding ids per host, sorted", () => {

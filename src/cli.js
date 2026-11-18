@@ -84,6 +84,9 @@ export function parseSites(text) {
     const id = typeof entry.url === "string" ? pageId(entry.url) : null;
     if (!id) {
       problems.push(`${at}: url must be a full address starting with https:// or http://, e.g. https://www.example.com/`);
+    } else if (entry.url !== entry.url.trim()) {
+      // The URL would be accepted (URL parsing trims) but used verbatim as the baseline key.
+      problems.push(`${where(i)}: url ${JSON.stringify(entry.url)} has spaces at the start or end; remove them`);
     } else if (firstIndex.has(id)) {
       problems.push(`${at}: same page as sites[${firstIndex.get(id)}]; list each page once (ios: true adds the iPhone variant)`);
     } else {
@@ -133,7 +136,13 @@ export function nextBaseline(oldSites, results, { update = true } = {}) {
   return next;
 }
 
-const hostOf = (key) => scriptHost(key) || key;
+/**
+ * Where trait memory for a script lives: its host. blob: scripts get a separate `blob:<page host>`
+ * bucket (`blob:null` for opaque origins), so runtime-generated code cannot inherit the traits of
+ * the page's own scripts, e.g. a skimmer injected as a blob on a checkout page whose own code
+ * already references card fields.
+ */
+const hostOf = (key) => (key.startsWith("blob:") ? `blob:${scriptHost(key) || "null"}` : scriptHost(key) || key);
 
 /**
  * Split findings into fresh (the script's host never showed this trait before → alarm)
@@ -221,24 +230,43 @@ async function scanTarget(browser, target, oldEntry, opts) {
   }
 }
 
+const OPTIONS = {
+  config: { type: "string", default: "sites.yml" },
+  baseline: { type: "string", default: "baseline.json" },
+  report: { type: "string", default: "report.md" },
+  "update-baseline": { type: "boolean", default: false },
+  "timeout-ms": { type: "string", default: "30000" },
+  "settle-ms": { type: "string", default: "3000" },
+  help: { type: "boolean", short: "h", default: false },
+};
+
+/** Milliseconds options: whole numbers only, so "30s" fails instead of silently becoming NaN. */
+const MS_OPTIONS = { "timeout-ms": 1, "settle-ms": 0 };
+
+/** Report path even when the arguments are invalid, so argument errors reach the job summary too. */
+function reportPathOf(argv) {
+  try {
+    const { values } = parseArgs({ args: argv, options: OPTIONS, strict: false });
+    return typeof values.report === "string" ? values.report : OPTIONS.report.default;
+  } catch {
+    return OPTIONS.report.default;
+  }
+}
+
 /** @returns {Promise<number>} exit code */
 export async function main(argv) {
   let args;
   try {
-    ({ values: args } = parseArgs({
-      args: argv,
-      options: {
-        config: { type: "string", default: "sites.yml" },
-        baseline: { type: "string", default: "baseline.json" },
-        report: { type: "string", default: "report.md" },
-        "update-baseline": { type: "boolean", default: false },
-        "timeout-ms": { type: "string", default: "30000" },
-        "settle-ms": { type: "string", default: "3000" },
-        help: { type: "boolean", short: "h", default: false },
-      },
-    }));
+    ({ values: args } = parseArgs({ args: argv, options: OPTIONS }));
+    for (const [name, min] of Object.entries(MS_OPTIONS)) {
+      if (!/^\d+$/.test(args[name]) || Number(args[name]) < min) {
+        throw new Error(`--${name} must be a whole number of milliseconds of at least ${min}, e.g. ${OPTIONS[name].default}; got "${args[name]}"`);
+      }
+    }
   } catch (e) {
-    console.error(`${e.message}\n\n${USAGE}`);
+    const message = `${e.message}\n\n${USAGE}`;
+    console.error(message);
+    await writeFile(reportPathOf(argv), buildErrorReport(message)).catch(() => {});
     return 1;
   }
   if (args.help) {
@@ -278,9 +306,9 @@ export async function main(argv) {
 
   const update = args["update-baseline"] || !baseline;
   const oldSites = baseline?.sites ?? {};
-  const pruned = update ? Object.keys(oldSites).filter((site) => !results.some((r) => r.site === site)).sort() : [];
+  const gone = Object.keys(oldSites).filter((site) => !results.some((r) => r.site === site)).sort();
 
-  const report = buildReport(results, { pruned });
+  const report = buildReport(results, update ? { pruned: gone } : { stale: gone });
   await writeFile(args.report, report.markdown);
   console.log(report.markdown);
 
