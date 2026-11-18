@@ -2,3 +2,5 @@ node_modules/
 .superpowers/
 *.log
 report.md
+# Personal Claude Code instructions for this machine, not part of the project
+CLAUDE.md
