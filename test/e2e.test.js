@@ -42,17 +42,18 @@ before(async () => {
 
 after(() => server?.close());
 
-async function cli(...extra) {
-  const args = [BIN, "--config", join(dir, "sites.yml"), "--baseline", join(dir, "baseline.json"),
-    "--report", join(dir, "report.md"), "--settle-ms", "300", "--timeout-ms", "10000", ...extra];
+/** Runs the CLI on sites.yml / baseline.json / report.md in directory `d`; returns the exit code. */
+async function runIn(d, ...extra) {
   try {
-    await run(process.execPath, args);
+    await run(process.execPath, [BIN, "--config", join(d, "sites.yml"), "--baseline", join(d, "baseline.json"),
+      "--report", join(d, "report.md"), "--settle-ms", "300", "--timeout-ms", "10000", ...extra]);
     return 0;
   } catch (e) {
     if (typeof e.code !== "number") throw e;
     return e.code;
   }
 }
+const cli = (...extra) => runIn(dir, ...extra);
 
 test("first run creates a baseline including dynamically loaded scripts", async () => {
   assert.equal(await cli("--update-baseline"), 0);
@@ -102,14 +103,7 @@ test("repeated runs on an unchanged site leave baseline.json byte-identical", as
 // ---- Open review points: baseline lifecycle (own temp dirs, harmless experiment code) ----
 async function cliIn(d, sites, ...extra) {
   await writeFile(join(d, "sites.yml"), `sites:\n${sites.map((u) => `  - url: ${u}\n`).join("")}`);
-  try {
-    await run(process.execPath, [BIN, "--config", join(d, "sites.yml"), "--baseline", join(d, "baseline.json"),
-      "--report", join(d, "report.md"), "--settle-ms", "300", "--timeout-ms", "10000", ...extra]);
-    return 0;
-  } catch (e) {
-    if (typeof e.code !== "number") throw e;
-    return e.code;
-  }
+  return runIn(d, ...extra);
 }
 const baselineSites = async (d) => Object.keys(JSON.parse(await readFile(join(d, "baseline.json"), "utf8")).sites).sort();
 
@@ -130,6 +124,17 @@ test("with --update-baseline a site removed from sites.yml is dropped and named 
   const report = await readFile(join(d, "report.md"), "utf8");
   assert.match(report, /no longer in sites\.yml/i);
   assert.ok(report.includes(`\`${base}\``), report);
+});
+
+test("without --update-baseline a removed site is kept and the report says how to drop it", async () => {
+  overrides.clear();
+  const d = await mkdtemp(join(tmpdir(), "sdw-e2e-stale-"));
+  assert.equal(await cliIn(d, [base, `${base}index.html`], "--update-baseline"), 0);
+  assert.equal(await cliIn(d, [`${base}index.html`]), 0);
+  assert.deepEqual(await baselineSites(d), [base, `${base}index.html`]);
+  const report = await readFile(join(d, "report.md"), "utf8");
+  assert.ok(report.includes(`\`${base}\``), report);
+  assert.match(report, /--update-baseline/);
 });
 
 // ---- Open review point: blob: scripts ----

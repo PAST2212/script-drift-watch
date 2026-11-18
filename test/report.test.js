@@ -107,6 +107,14 @@ test("sites dropped from the baseline are named in the report without changing t
   assert.match(r.markdown, /`https:\/\/old\.example\/`/);
 });
 
+test("sites kept in the baseline but no longer in sites.yml are named with how to drop them", () => {
+  const r = buildReport([{ site: "https://shop.example", firstRun: false, diff: noDiff, findings: {} }], { stale: ["https://old.example/"] });
+  assert.equal(r.exitCode, 0);
+  assert.match(r.markdown, /no longer in sites\.yml/i);
+  assert.match(r.markdown, /`https:\/\/old\.example\/`/);
+  assert.match(r.markdown, /--update-baseline/);
+});
+
 test("the error report says the scan did not run and keeps the message inside its code block", () => {
   const md = buildErrorReport("sites.yml: bad\n```\n# Injected heading");
   assert.match(md, /did not run/i);

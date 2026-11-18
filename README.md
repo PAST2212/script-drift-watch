@@ -39,7 +39,8 @@ A single ignore pattern can also be written as `ignore: "googletagmanager.com/gt
 `sites.yml` stop the run instead of being silently misread, and the job summary lists every
 problem with its line number. Examples: an unknown key such as `ignores:` (with a "did you mean"),
 `ios: yes` instead of `true`, an empty ignore pattern (which would skip every script), a URL
-without `https://`, or the same page listed twice.
+without `https://` or with spaces around it, or the same page listed twice. Invalid extra
+arguments in `args` (an unknown option, `--settle-ms 5s` instead of `5000`) are reported the same way.
 
 **2.** Add `.github/workflows/script-drift-watch.yml`:
 
@@ -106,12 +107,12 @@ node bin/script-drift-watch.js --config sites.yml --update-baseline
 | `--config` | `sites.yml` | Sites file |
 | `--baseline` | `baseline.json` | Baseline file |
 | `--report` | `report.md` | Markdown report output |
-| `--update-baseline` | off | Write the current state as the new baseline and drop sites that are no longer in the sites file. Without it, existing entries are never changed; only sites scanned for the first time are added |
-| `--timeout-ms` | `30000` | Page load timeout |
-| `--settle-ms` | `3000` | Extra wait for late-loading scripts |
+| `--update-baseline` | off | Write the current state as the new baseline and drop sites that are no longer in the sites file. Without it, existing entries are never changed; only sites scanned for the first time are added, and sites no longer in the file are named in the report |
+| `--timeout-ms` | `30000` | Page load timeout in whole milliseconds (at least 1) |
+| `--settle-ms` | `3000` | Extra wait for late-loading scripts in whole milliseconds |
 
 Exit codes: `0` nothing or only informational/medium findings, `2` new high-severity finding, `1` error
-(for an invalid sites file or baseline, the report explains the problem).
+(for invalid arguments, sites file or baseline, the report explains the problem).
 A site that cannot be loaded (network error or non-2xx status) keeps its old baseline and is
 counted in the report headline, but does not change the exit code. A page that never finishes
 loading is still scanned with the scripts that did load.
@@ -119,9 +120,11 @@ loading is still scanned with the scripts that did load.
 Script identity is the URL without the fragment and without common cache-buster parameters
 (`v`, `t`, `_`, `cb`, `ts`, `rev`, …). Other parameters such as `gtag/js?id=G-…` stay part of the
 identity. Scripts created at runtime from `blob:` URLs get a random URL on every load, so they are
-identified by their page's origin and content hash instead (`blob:https://shop.example/sha256-…`),
-and their traits count for the page's host. The baseline file is written in a canonical order, so
-it only changes when your scripts do.
+identified by their page's origin and content hash instead (`blob:https://shop.example/sha256-…`).
+Their traits are remembered separately from the page's own scripts (as `blob:shop.example`), so
+a skimmer injected as a blob on a checkout page cannot hide behind the card-field trait of the
+shop's own code. The baseline file is written in a canonical order, so it only changes when your
+scripts do.
 
 ## Rules
 
@@ -133,14 +136,14 @@ A changed script without findings is listed as info.
 | Rule | Severity | Fires when a script… |
 |---|---|---|
 | `clipboard-hijack` | high | accesses the clipboard **and** contains wallet addresses / wallet regexes |
-| `obfuscated-loader` | high | runs base64-decoded code (`atob` close to `eval` / `new Function`, also `(0,eval)(…)`, `window["eval"](…)` and `setTimeout(atob(…))`) |
-| `card-field-access` | high | names card fields in strings, selectors or regexes (`"cc-number"`, `[name=cardnumber]`, `/cvv\|cvc/`, …), not mere identifiers like `new Cvc()` |
+| `obfuscated-loader` | high | runs base64-decoded code (`atob` close to `eval` / `new Function`, also `eval.call(…)`, `(0,eval)(…)`, `(0, window.eval)(…)`, `window["eval"](…)` and `setTimeout(atob(…))`) |
+| `card-field-access` | high | names card fields in strings, selectors or regexes (`"cc-number"`, `[name=cardnumber]`, Magento's `payment[cc_number]` / `cc_cid`, `.cc-number`, `/^cvc$/`, `/cvv\|cvc/`, …), not mere identifiers like `new Cvc()` |
 | `input-value-hook` | high | hooks the `value` property of `HTMLInputElement` |
 | `known-ioc` | high | contains a published IoC (`1688360.cc`, Adform C2 IP) |
-| `clipboard-access` | medium | reads or writes the clipboard (Clipboard API, copy/cut/paste events, `execCommand("copy")`) |
+| `clipboard-access` | medium | reads or writes the clipboard (Clipboard API, copy/cut/paste events, `execCommand("copy")` in any letter case) |
 | `wallet-pattern` | medium | contains a BTC/ETH/TRON address or an ETH address regex |
 | `ios-only-branch` | medium | branches on iPhone/iPad user agents |
-| `exfil-sink` | medium | sends data to / loads code from a different registrable domain (each tenant of shared hosts such as `cloudfront.net` or `workers.dev` counts as its own domain) |
+| `exfil-sink` | medium | sends data to / loads code from a different registrable domain (each tenant of shared hosts such as `cloudfront.net` or `workers.dev`, and every `*.amazonaws.com` host, counts as its own domain) |
 
 The rules are deliberately simple regex heuristics, tuned against real libraries (pdf.js, pdf-lib,
 mermaid, docx) to keep noise low. They will not catch every payload. Their job is to make sure

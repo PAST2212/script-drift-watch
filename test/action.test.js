@@ -207,6 +207,13 @@ test("package.json engines claims only Node versions that CI tests", async () =>
   assert.equal(pkg.engines.node, `>=${Math.min(...tested)}`);
 });
 
+test("CI installs dependencies without lifecycle scripts too, like the action", async () => {
+  const ci = YAML.parse(await readFile(join(ROOT, ".github/workflows/test.yml"), "utf8"));
+  const installs = Object.values(ci.jobs).flatMap((j) => j.steps ?? []).map((s) => s.run ?? "").filter((r) => /\bnpm (ci|install)\b/.test(r));
+  assert.ok(installs.length, "no npm install step in .github/workflows/test.yml");
+  for (const r of installs) assert.match(r, /npm ci\b[^\n]*--ignore-scripts/, r);
+});
+
 test("I7: runtime dependencies are pinned exactly, locked with integrity hashes, and installed with npm ci without lifecycle scripts", async () => {
   const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8"));
   const lock = JSON.parse(await readFile(join(ROOT, "package-lock.json"), "utf8"));
