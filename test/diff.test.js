@@ -65,3 +65,11 @@ test("scriptKey drops common cache-buster parameters but keeps the rest, order-i
   );
   assert.equal(scriptKey("https://x.example/a.js?lang=de&id=1&t=5"), "https://x.example/a.js?id=1&lang=de");
 });
+test("a changed secondary response body is visible when a normalized script key has several editions", () => {
+  const key = "https://cdn.example/experiment.js";
+  const before = { [key]: { url: key, hash: "a", hashes: ["a", "b"] } };
+  const after = { [key]: { url: key, hash: "a", hashes: ["a", "c"] } };
+  assert.deepEqual(diffSite(before, after).changed, [key]);
+  assert.deepEqual(diffSite(after, after).changed, []);
+  assert.deepEqual(diffSite(after, { [key]: { url: key, hash: "a" } }).changed, [key]);
+});

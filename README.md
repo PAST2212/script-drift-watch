@@ -1,26 +1,26 @@
 # script-drift-watch
 
-**Get an alert when a trusted third-party script on your website suddenly starts stealing.**
+**Watch the scripts your website delivers. Get an alert when a trusted loader starts serving code with signs of clipboard hijacking or card skimming.**
 
 On 16 November 2026, attackers abused Optimizely Web Experimentation to push a card skimmer,
 a crypto clipper and iOS exploit kits through the official Optimizely snippet. Report URI found the
 injected code in snippets belonging to 178 organisations ([sources](#sources)). In July 2026,
 Adform's tracking script was turned into a crypto clipper the same way.
 
-In both cases the malicious code came **from the vendor's own, allow-listed domain with a valid
-certificate**. A Content Security Policy that allows the vendor did not help, and per-customer
-snippets that change all the time cannot be pinned with Subresource Integrity.
-
-What *did* change was the script's content and behaviour. `script-drift-watch` watches exactly that:
+In the Optimizely incident, the vendor URL and its certificate stayed valid while the script
+changed. In one documented variant, the trusted snippet instructed the browser to fetch a
+second script from another domain. The scanner watches both parts of that sequence.
 
 1. Loads your pages in real headless Chromium (so runtime-injected scripts from A/B testing tools
-   and tag managers are included). Optionally a second time as an iPhone.
-2. Hashes every external script and compares it to a baseline stored in your repository.
+   and tag managers are included). An optional second Chromium visit uses an iPhone profile.
+2. Hashes the external script bodies the browser can read and compares them to a baseline stored in your repository.
 3. Checks new or changed scripts for clipper, skimmer and loader traits.
-4. Opens a GitHub issue (and fails the job) when a script host **gains** a high-severity trait
-   it never showed before.
+4. Records which external script requested each new script origin. Opens a GitHub issue and
+   fails the job for a fresh high-severity content or script-load finding.
 
-No server, no account, nothing sent to third parties. It runs as a scheduled GitHub Action in your own repo.
+You can run the scanner locally or schedule it in your own GitHub repository. Chromium contacts
+the configured pages and their resources. The Action writes its report to the job summary and,
+by default, opens an issue for a fresh high-severity finding.
 
 ## Quick start (GitHub Action)
 
@@ -43,6 +43,9 @@ without `https://` or with spaces around it, or the same page listed twice. Inva
 arguments in `args` (an unknown option, `--settle-ms 5s` instead of `5000`) are reported the same way.
 
 **2.** Add `.github/workflows/script-drift-watch.yml`:
+
+Replace `OWNER/script-drift-watch@v1` with the repository and tag or commit that contain your
+copy of the Action. For a checkout of the scanner repository itself, use `uses: ./` after checkout.
 
 ```yaml
 name: Script Drift Watch
@@ -67,11 +70,12 @@ jobs:
 ```
 
 **3.** Run it once via *Actions → Script Drift Watch → Run workflow*. The first run creates and
-commits `baseline.json` and records the traits each script host already has (only known IoCs
-alarm on the first run). From then on every run compares against it.
+commits `baseline.json` and records the traits and script origins already present. Known IoCs
+and explicit script-origin policy violations alarm even on the first run.
 
-When something suspicious shows up, you get an issue (GitHub e-mails you) and the job summary
-shows the script URL, the rule that fired and a short code excerpt.
+For a content finding, the report shows the matching rule and a source excerpt. For a load
+finding, it shows the rule, the initiating script and the requested URL. If issue creation
+fails, the Action skips the baseline commit so the next run can retry the alert.
 
 ### Action inputs
 
@@ -111,7 +115,7 @@ node bin/script-drift-watch.js --config sites.yml --update-baseline
 | `--timeout-ms` | `30000` | Page load timeout in whole milliseconds (at least 1) |
 | `--settle-ms` | `3000` | Extra wait for late-loading scripts in whole milliseconds |
 
-Exit codes: `0` nothing or only informational/medium findings, `2` new high-severity finding, `1` error
+Exit codes: `0` no fresh high-severity finding, `2` fresh high-severity finding, `1` error
 (for invalid arguments, sites file or baseline, the report explains the problem).
 A site that cannot be loaded (network error or non-2xx status) keeps its old baseline and is
 counted in the report headline, but does not change the exit code. A page that never finishes
@@ -123,15 +127,57 @@ identity. Scripts created at runtime from `blob:` URLs get a random URL on every
 identified by their page's origin and content hash instead (`blob:https://shop.example/sha256-…`).
 Their traits are remembered separately from the page's own scripts (as `blob:shop.example`), so
 a skimmer injected as a blob on a checkout page cannot hide behind the card-field trait of the
-shop's own code. The baseline file is written in a canonical order, so it only changes when your
-scripts do.
+shop's own code. The baseline records observed load relationships per page and browser profile.
+It is written in a canonical order so identical observations produce identical files.
 
 ## Rules
 
-Only **new or changed** scripts are checked. A finding alarms only if the script's host never showed
+Content rules check **new or changed** scripts. A content finding alarms if the script's host never showed
 that trait before, so a payment SDK update that still reads card fields, or a new hashed bundle from
 your own domain, is listed as "known trait" info instead of opening an issue. `known-ioc` always alarms.
 A changed script without findings is listed as info.
+
+### Script loads
+
+Chromium records the external script that initiated an HTTP(S) script request when it can
+attribute it. Each relationship uses the initiating script's normalized URL and the destination's
+exact origin (scheme, hostname and port). The report includes the observed child URL.
+
+| Rule | Severity | Trigger |
+|---|---|---|
+| `new-script-origin` | medium | A loader without an explicit origin policy requests code from an external origin it has never used on this target. |
+| `clipper-script-load` | high | A cross-origin load relationship is new or newly delivers a child with both clipboard and wallet indicators. The indicators must occur in that child's source. |
+| `disallowed-script-origin` | high | A script with an explicit origin policy attempts to load code outside that policy, including a failed request or a redirect hop. |
+
+For sensitive pages, set `allowed-script-origins` in `sites.yml`. Keys are exact HTTP(S) loader
+URLs, normalized like baseline script keys. Values are lists of HTTP(S) origins. An empty list
+forbids every attributable HTTP(S) script load by that loader, including same-origin requests.
+For an attributable redirected loader, policies on the original request URL and the final
+script URL both apply. The report shows both when they differ.
+
+```yaml
+sites:
+  - url: https://shop.example.com/checkout
+    allowed-script-origins:
+      "https://cdn.vendor.example/experiment.js":
+        - "https://assets.vendor.example"
+```
+
+The policy grants permission only for the destination. A permitted child can still raise a
+content or clipper alarm. Without a policy, a new benign origin produces a report entry and
+exit code 0. A loader hash update with the same behavior also stays informational.
+Only the configuration grants approval. Saving a baseline remembers observations. On repeat
+scans of an ongoing high-severity load, the summary shows **Still observed** and the load
+does not create another issue. Independent fresh high findings can still open one.
+A scan that misses an intermittent load retains its history. A clean observed response can
+clear a clipper finding, and an explicit policy change can clear a destination violation.
+
+Existing baselines seed the new relationship history on their next update. Ordinary content
+checks and explicit policies still run during that scan. For a trial on production pages, use a
+separate baseline with `open-issue: false` and `fail-on-high: false`. Review the summaries against
+known vendor releases before enabling notifications.
+
+### Script content
 
 | Rule | Severity | Fires when a script… |
 |---|---|---|
@@ -163,6 +209,12 @@ that a trusted vendor script gaining clipper/skimmer traits does not go unnotice
 - **Inline and `data:` scripts are ignored.** Only scripts loaded from a URL (including `blob:`) are
   tracked. A `blob:` script whose content differs on every load shows up as new on every run;
   skip those with `ignore: ["blob:"]`.
+- **Attribution can be unavailable.** Parser loads, inline scripts and early requests from an
+  isolated frame can lack a verifiable external initiator. Their available script bodies still
+  receive the usual content checks. If one URL returns multiple bodies, or a body on one request
+  and a failed request on another, the scanner reports the ambiguity. It checks available editions
+  for content findings and attributes a clipper to a loader only when the child body is identifiable.
+  Origin policies still apply to requests with a verified initiator. Load rules honor URL ignore patterns on either end.
 - **Baseline moves on.** After an alarm the baseline is updated, so the issue is your record.
   With `commit-baseline: false` you must commit an initial `baseline.json` yourself (e.g. made with
   the CLI), otherwise every run is a first run; the action warns about this.
@@ -193,9 +245,15 @@ npx playwright install --no-shell chromium
 npm test
 ```
 
-Tests are written test-first with `node:test`: unit tests for the rules, diff and report, an end-to-end
-test with a local site and real Chromium, and a test that runs the action's shell steps against a
-local git remote and a fake `gh`.
+To verify the issue decision with real Chromium, run the focused Action test. It uses loopback
+sites and a local `gh` stand-in. An ordinary vendor update and a new benign origin produce zero
+issues. An unknown-domain test script with inert clipper indicators produces one issue with the
+loader and child URLs. On the next identical scan the finding stays visible and the issue count
+stays at one.
+
+```bash
+node --test --test-name-pattern="unknown-domain clipper" test/action.test.js
+```
 
 On Windows, the action test needs Git Bash ahead of the WSL `bash.exe` launcher on `PATH`
 (PowerShell: `$env:PATH = "C:\Program Files\Git\bin;" + $env:PATH`).
@@ -210,6 +268,8 @@ git tag -a v1.0.0 -m "v1.0.0" && git tag -f v1 && git push origin v1.0.0 && git 
 
 ## Sources
 
+- [Optimizely's initial customer incident report](https://pages.optimizely.com/rs/947-RKE-048/images/Security%20Incident%20Report%20-%20Optimizely%20Web%20Experimentation%20-%20Nov%2017%202026.pdf)
+- [Report URI's investigation and published loader excerpt](https://blog.report-uri.com/worlds-largest-brands-infected-with-malware-via-optimizely/)
 - heise online: [Große Marken lieferten Malware-Skript durch Lieferkettenangriff aus](https://www.heise.de/news/Grosse-Marken-lieferten-Malware-Skript-durch-Lieferkettenangriff-aus-11527514.html) (17 Nov 2026)
 - The Hacker News: [Hijacked Optimizely Scripts Served Card Skimmer and iOS Exploit Kits](https://thehackernews.com/2026/11/hijacked-optimizely-scripts-served-card.html)
 - SOCRadar: [Optimizely Attack Hits Zoom, BBC, CNN With Skimmer, iOS Kits](https://socradar.io/blog/optimizely-attack-hits-zoom-bbc-cnn-with-skimmer-ios-kits/)

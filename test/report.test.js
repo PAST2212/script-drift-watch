@@ -37,6 +37,13 @@ test("a changed script without findings is listed as info with exit code 0", () 
   assert.match(r.markdown, /123\.js/);
 });
 
+test("a content finding on an ambiguous URL explains why its loader cannot be named", () => {
+  const result = buildReport([{ site: "https://shop.example", firstRun: false, diff: { ...noDiff, changed: [SCRIPT] },
+    findings: { [SCRIPT]: [high] }, ambiguousUrls: [SCRIPT] }]);
+  assert.equal(result.exitCode, 2);
+  assert.match(result.markdown, /Multiple response bodies/);
+});
+
 test("first run says the baseline was created and never alarms", () => {
   const r = buildReport([
     { site: "https://shop.example", firstRun: true, diff: { ...noDiff, added: [SCRIPT] }, findings: {} },

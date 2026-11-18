@@ -38,6 +38,10 @@ export function scriptHost(url) {
   }
 }
 
+export function sameScriptContent(a, b) {
+  return a?.hash === b.hash && JSON.stringify(a?.hashes) === JSON.stringify(b.hashes);
+}
+
 /**
  * Compare the scripts of one site against its baseline.
  * @param {Record<string,{hash:string,url:string}>|undefined} baseline
@@ -49,7 +53,7 @@ export function diffSite(baseline = {}, current = {}) {
   const changed = [];
   for (const [key, entry] of Object.entries(current)) {
     if (!(key in base)) added.push(key);
-    else if (base[key].hash !== entry.hash) changed.push(key);
+    else if (!sameScriptContent(base[key], entry)) changed.push(key);
   }
   const removed = Object.keys(base).filter((key) => !(key in current));
   return { added: added.sort(), changed: changed.sort(), removed: removed.sort() };
